@@ -4,21 +4,25 @@
 #
 #   Usage: ./migrate_libvirt_vm.sh <vm_name> [output_dir] [--dry-run]
 #
-#   SCRIPT VERSION 1.0
+#   SCRIPT VERSION 1.1
 #
 #   REQUIREMENTS / SUPPORTED SCOPE
 #   - libvirt versions supported: libvirt 10.x–11.x
 #   - Source VM MUST already be fully shut down before this script runs.
 #   - Restoration assumes no existing VM with same name, or if exists, will be
-#     destroyed and forcibly overrwritten without further warnings.
+#     destroyed and forcibly overwritten without further warnings.
 #   - Disk types supported: local libvirt file, volume, and block sources only.
 #   - Assumes the default virsh connection is the local system libvirt instance
 #     (normally qemu:///system); host paths and the default swtpm state path must
 #     belong to that same instance.
 #   - Python 3, virsh, qemu-img, GNU coreutils and GNU grep are required.
-#   - Target is a clone: restore.sh generates a fresh domain UUID for each restore,
-#     MAC addresses and other guest-identifying configuration are preserved - i.e.
-#     *** DO NOT RESTORE AND RUN ON THE SAME NETWORK WHERE CLONE SOURCE EXISTS ***
+#   - Restoration preserves the source domain UUID by default, including its
+#     default swtpm state association. Use ./restore.sh --new-uuid only when an
+#     intentional clone with a new domain UUID is required.
+#   - MAC addresses and other guest-identifying configuration are preserved in
+#     both modes. Do not run a clone on the same network as its source until its
+#     network identity (including MAC addresses) has been changed.
+#   - A preserved UUID must not already belong to a different domain on the target.
 #   - Standard libvirt swtpm state location is assumed when the TPM XML does not
 #     explicitly identify a state path: /var/lib/libvirt/swtpm/<domain-UUID>.
 #   - Only emulated swtpm state is packaged. Passthrough/external TPM backends
@@ -35,7 +39,7 @@
 #
 #   Produces:
 #     <output_dir>/
-#       - domain.xml       portable libvirt XML (bundle-relative paths; no source UUID)
+#       - domain.xml       portable libvirt XML (bundle-relative paths; source UUID retained)
 #       - disks/           flattened unencrypted disks; byte-preserved encrypted disks
 #       - firmware/        NVRAM, pflash, loader, firmware/template files
 #       - media/           CD-ROM / floppy images
@@ -74,6 +78,9 @@ Usage: migrate_libvirt_vm.sh <vm_name> [output_dir] [--dry-run]
   <vm_name>    name of the defined, fully shut-down libvirt domain
   [output_dir] destination directory (default: ./<vm_name>-bundle)
   --dry-run    show what would be copied without writing files
+
+After export, restore.sh preserves the source UUID by default.
+Use: ./restore.sh --new-uuid  for an intentional clone.
 USAGE
     exit "${1:-0}"
 }
@@ -214,12 +221,19 @@ virsh dumpxml "$VM_NAME" > "$DOMAIN_XML"
 require_source_vm_shut_off "after domain XML capture"
 
 # extract the VM UUID early — needed for TPM paths and secrets
-DOMAIN_UUID="$(python3 -c "
-import xml.etree.ElementTree as ET
-root = ET.parse('$DOMAIN_XML').getroot()
+DOMAIN_UUID="$(python3 - "$DOMAIN_XML" <<'PYDOMAINUUID'
+import sys, uuid, xml.etree.ElementTree as ET
+root = ET.parse(sys.argv[1]).getroot()
 u = root.find('./uuid')
-print(u.text.strip() if u is not None else '')
-")"
+if u is None or not (u.text or '').strip():
+    raise SystemExit('ERROR: source domain XML has no UUID')
+try:
+    print(str(uuid.UUID(u.text.strip())))
+except ValueError:
+    raise SystemExit('ERROR: source domain XML contains an invalid UUID')
+PYDOMAINUUID
+)"
+[[ -n "$DOMAIN_UUID" ]] || { echo "ERROR: could not determine source domain UUID" >&2; exit 1; }
 
 # capture host environment
 {
@@ -909,7 +923,7 @@ if node is not None:
 require_source_vm_shut_off "after payload collection"
 
 # ---------------------------------------------------------------
-#  7  build portable domain.xml (relative paths, no uuid)
+#  7  build portable domain.xml (relative paths; preserve source UUID)
 # ---------------------------------------------------------------
 echo ""
 echo "==> Building portable domain.xml"
@@ -966,11 +980,11 @@ def out_rel(abspath, out_dir):
 tree = ET.parse(domain_xml)
 root = tree.getroot()
 
-# --- strip elements that must not survive migration ---
-for tag in ('uuid',):
-    el = root.find('./' + tag)
-    if el is not None:
-        root.remove(el)
+# Preserve the source domain UUID. Restore defaults to identity-preserving
+# migration; restore.sh --new-uuid can replace it for an intentional clone.
+source_uuid = root.find('./uuid')
+if source_uuid is None or not (source_uuid.text or '').strip():
+    raise SystemExit('ERROR: source domain UUID is missing from domain XML')
 
 # --- rewrite disk and media sources ---
 disk_map = {}
@@ -1067,6 +1081,30 @@ for os_el in root.iter('os'):
             if old_template not in firmware_map:
                 raise SystemExit('ERROR: NVRAM template was not packaged: ' + old_template)
             child.set('template', firmware_map[old_template])
+
+# --- turn resolved EFI auto-selection into an explicit portable firmware setup ---
+# A dumped domain can retain os@firmware="efi" even after libvirt has resolved
+# the firmware to concrete <loader> and <nvram> paths. Keeping that attribute
+# asks the TARGET libvirt to run firmware auto-selection again, which can fail
+# when the target's QEMU firmware descriptor catalog differs (or does not
+# advertise the same feature combination), even when the actual firmware files
+# have been bundled. When this bundle contains the selected loader image, use
+# the packaged loader and NVRAM/template paths directly instead. Preserve the
+# loader attributes (type, readonly, secure, stateless, format) and NVRAM attrs.
+# Remove <firmware> feature constraints because those are auto-selection inputs;
+# Secure Boot state is retained by the selected loader and NVRAM/template files.
+packaged_firmware_paths = set(firmware_map.values())
+for os_el in root.iter('os'):
+    if (os_el.get('firmware') or '').lower() != 'efi':
+        continue
+    loader_el = next((c for c in list(os_el) if c.tag.split('}')[-1] == 'loader'), None)
+    loader_path = (loader_el.text or '').strip() if loader_el is not None and loader_el.text else ''
+    if loader_path and loader_path in packaged_firmware_paths:
+        os_el.attrib.pop('firmware', None)
+        for child in list(os_el):
+            if child.tag.split('}')[-1] == 'firmware':
+                os_el.remove(child)
+        print('EFI firmware auto-selection disabled: using bundled explicit loader/NVRAM paths')
 
 # --- rewrite TPM source paths ---
 tpm_records = []
@@ -1374,12 +1412,19 @@ Source host: $(uname -a)
 SCOPE AND REQUIREMENTS
   - Source VM was required to be fully shut down before export.
   - Supported guest disk source types: file, volume, block.
-- Intended software scope: libvirt 10.x–11.x and QEMU up to 11.1.2.
+  - Intended software scope: libvirt 10.x–11.x and QEMU up to 11.1.2.
   - Unencrypted disks are flattened to standalone QCOW2 images.
   - Encrypted disks are copied byte-for-byte and are not flattened.
-  - A fresh UUID is generated each time restore.sh is run; MAC addresses remain unchanged.
+  - Resolved EFI loader and NVRAM/template files are bundled and restored as explicit
+    firmware paths, avoiding a second target-side firmware auto-selection pass.
+  - If the source XML has no resolved loader path, EFI auto-selection remains enabled
+    and the target must provide compatible QEMU firmware descriptors.
+  - restore.sh preserves the source domain UUID by default, including its default
+    swtpm state association. Use ./restore.sh --new-uuid for an intentional clone.
+  - MAC addresses remain unchanged in both modes. Before running a --new-uuid clone
+    on the same network as its source, change its MAC address(es) in the domain XML.
   - Only emulated swtpm state is packaged. TPM passthrough/external backends are unsupported.
-  - Standard target swtpm state location: /var/lib/libvirt/swtpm/<new-domain-UUID>.
+  - Standard target swtpm state location: /var/lib/libvirt/swtpm/<domain-UUID>.
   - File-backed TPM source requires target libvirt 10.10 or newer.
   - Host compatibility (CPU, machine type, firmware, network bridges, PCI/USB devices)
     must be checked separately. This bundle does not make host devices portable.
@@ -1412,14 +1457,41 @@ echo "==> Generating restore.sh"
 if (( ! DRY_RUN )); then
 cat > "${OUTPUT_DIR}/restore.sh" <<RESTORE_EOF
 #!/usr/bin/env bash
-# Restore/clone the '$VM_NAME' VM bundle on this host.
+# Restore the '$VM_NAME' VM bundle on this host.
+# Default: preserve the source domain UUID. Use --new-uuid for an intentional clone.
 set -euo pipefail
 IFS=\$'\n\t'
 
 SCRIPT_DIR="\$(cd "\$(dirname "\${BASH_SOURCE[0]}")" && pwd)"
 VM_NAME="$VM_NAME"
-# New UUID per restoration: this is a clone, not an identity-preserving live migration.
-VM_UUID="\$(python3 -c 'import uuid; print(uuid.uuid4())')"
+RESTORE_NEW_UUID=0
+for arg in "\$@"; do
+    case "\$arg" in
+        --new-uuid) RESTORE_NEW_UUID=1 ;;
+        --help|-h)
+            echo "Usage: ./restore.sh [--new-uuid]"
+            echo "Default preserves the original domain UUID. --new-uuid creates a clone UUID."
+            exit 0
+            ;;
+        *) echo "ERROR: unknown restore option: \$arg" >&2; exit 2 ;;
+    esac
+done
+SOURCE_UUID="\$(python3 - "\$SCRIPT_DIR/domain.xml" <<'PYRESTOREUUID'
+import sys, uuid, xml.etree.ElementTree as ET
+root = ET.parse(sys.argv[1]).getroot()
+el = root.find('./uuid')
+if el is None or not (el.text or '').strip():
+    raise SystemExit('ERROR: bundle domain.xml does not contain the source UUID')
+try:
+    print(str(uuid.UUID(el.text.strip())))
+except ValueError:
+    raise SystemExit('ERROR: bundle domain.xml contains an invalid source UUID')
+PYRESTOREUUID
+)"
+VM_UUID="\$SOURCE_UUID"
+if (( RESTORE_NEW_UUID )); then
+    VM_UUID="\$(python3 -c 'import uuid; print(uuid.uuid4())')"
+fi
 NVRAM_DEST_DIR="/var/lib/libvirt/qemu/nvram"
 TPM_DEST_BASE="/var/lib/libvirt/swtpm"
 
@@ -1429,8 +1501,14 @@ action() { echo "  >> \$*"; }
 
  echo "========================================"
 echo " Restoring VM: \$VM_NAME"
-echo " New domain UUID: \$VM_UUID"
-echo " Bundle dir:      \$SCRIPT_DIR"
+echo " Source domain UUID: \$SOURCE_UUID"
+if (( RESTORE_NEW_UUID )); then
+    echo " Restore mode: intentional clone (new UUID)"
+else
+    echo " Restore mode: identity-preserving (source UUID retained)"
+fi
+echo " Target domain UUID: \$VM_UUID"
+echo " Bundle dir:         \$SCRIPT_DIR"
 echo "========================================"
 
 # --- 0. Verify integrity BEFORE changing any host/domain state. ---
@@ -1443,6 +1521,16 @@ if ! (cd "\$SCRIPT_DIR" && sha256sum -c SHA256SUMS --quiet); then
     exit 1
 fi
 info "SHA256 checksums verified."
+
+# A domain UUID must be unique within the target libvirt instance. Replacing
+# the same VM name is allowed by the documented overwrite policy; a different
+# domain owning this UUID is never destroyed or modified.
+uuid_owner="\$(virsh domname "\$VM_UUID" 2>/dev/null || true)"
+if [[ -n "\$uuid_owner" && "\$uuid_owner" != "\$VM_NAME" ]]; then
+    echo "ERROR: requested domain UUID \$VM_UUID is already owned by domain '\$uuid_owner'." >&2
+    echo "Refusing to alter that domain. Resolve the UUID collision or use --new-uuid for an intentional clone." >&2
+    exit 1
+fi
 
 # Check existing secret UUIDs before any destructive domain/network operations.
 # A UUID can be shared by other domains, so this restore never changes an existing value.
@@ -1563,7 +1651,7 @@ PYSECPRIV
     done
 fi
 
-# --- 4. Restore TPM state under the new domain UUID. ---
+# --- 4. Restore TPM state under the selected domain UUID. ---
 tpm_source_mode=""
 if [[ -f "\$SCRIPT_DIR/tpm/source-mode.txt" ]]; then
     tpm_source_mode="\$(cat "\$SCRIPT_DIR/tpm/source-mode.txt")"
@@ -1603,26 +1691,29 @@ case "\$tpm_source_mode" in
     *) echo "ERROR: unknown TPM state layout: \$tpm_source_mode" >&2; exit 1 ;;
 esac
 
-# --- 5. Build a target-specific XML with a fresh UUID and host absolute paths. ---
+# --- 5. Build a target-specific XML with the selected UUID and host absolute paths. ---
 restore_xml="\$(mktemp "\${TMPDIR:-/tmp}/restore_domain.XXXXXX.xml")"
 trap 'rm -f -- "\$restore_xml"' EXIT
 python3 - "\$SCRIPT_DIR/domain.xml" "\$restore_xml" "\$SCRIPT_DIR" "\$VM_UUID" "\$NVRAM_DEST_DIR" "\$TPM_DEST_BASE/\$VM_UUID/state" "\$TPM_DEST_BASE/\$VM_UUID/state.raw" <<'PYRESTOREXML'
-import os, sys, shutil, xml.etree.ElementTree as ET
-src_xml, dst_xml, bundle, new_uuid, nvram_dir, tpm_dir_dest, tpm_file_dest = sys.argv[1:8]
+import os, sys, shutil, uuid, xml.etree.ElementTree as ET
+src_xml, dst_xml, bundle, target_uuid, nvram_dir, tpm_dir_dest, tpm_file_dest = sys.argv[1:8]
 bundle = os.path.abspath(bundle)
 tree = ET.parse(src_xml)
 root = tree.getroot()
 
-# This bundle intentionally creates a clone identity. Insert the generated UUID
-# in schema order (immediately after <name> if present).
-old = root.find('./uuid')
-if old is not None:
-    root.remove(old)
-uuid_el = ET.Element('uuid'); uuid_el.text = new_uuid
-name_el = root.find('./name')
-root.insert(list(root).index(name_el) + 1 if name_el is not None else 0, uuid_el)
+# Preserve the exported UUID by default. In --new-uuid mode, replace only the
+# UUID value; both modes retain the original guest configuration otherwise.
+uuid_el = root.find('./uuid')
+if uuid_el is None or not (uuid_el.text or '').strip():
+    raise SystemExit('ERROR: original domain UUID missing from portable XML')
+try:
+    target_uuid = str(uuid.UUID(target_uuid))
+    uuid.UUID(uuid_el.text.strip())
+except ValueError:
+    raise SystemExit('ERROR: invalid source or target domain UUID')
+uuid_el.text = target_uuid
 
-# A clone must get its own writable NVRAM copy, not use the bundle copy.
+# Give this restored domain its own writable NVRAM file, named for the selected UUID.
 os_el = root.find('./os')
 if os_el is not None:
     nvram = os_el.find('./nvram')
@@ -1632,7 +1723,7 @@ if os_el is not None:
         if not os.path.isfile(source):
             raise SystemExit('ERROR: bundled NVRAM file is missing: ' + source)
         os.makedirs(nvram_dir, exist_ok=True)
-        dest = os.path.join(nvram_dir, new_uuid + '_VARS.fd')
+        dest = os.path.join(nvram_dir, target_uuid + '_VARS.fd')
         if os.path.exists(dest):
             raise SystemExit('ERROR: target NVRAM path already exists: ' + dest)
         shutil.copy2(source, dest)
@@ -1679,7 +1770,7 @@ if [[ "\$actual_uuid" != "\$VM_UUID" ]]; then
     echo "ERROR: defined VM UUID mismatch: expected \$VM_UUID, got \$actual_uuid" >&2
     exit 1
 fi
-info "VM \$VM_NAME defined with new UUID \$VM_UUID. Review warnings/secrets, then start manually with: virsh start \$VM_NAME"
+info "VM \$VM_NAME defined with UUID \$VM_UUID. Review warnings/secrets, then start manually with: virsh start \$VM_NAME"
 echo "========================================"
 RESTORE_EOF
 chmod +x "${OUTPUT_DIR}/restore.sh"
